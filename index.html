@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>STT WebApp</title>
+    <style>
+        #transcript { 
+            white-space: pre-wrap; 
+            font-family: monospace; 
+            border: 1px solid #ccc; 
+            padding: 10px; 
+            min-height: 100px; 
+        }
+        .highlight { background-color: yellow; }
+        #status { 
+            margin-top: 10px; 
+            padding: 5px; 
+            border: 1px solid #ccc; 
+            font-weight: bold; 
+        }
+        #status.idle { color: gray; }
+        #status.listening { color: blue; }
+        #status.speaking { color: green; }
+        #status.stopped { color: red; }
+        #status.error { color: red; }
+        #volume-indicator {
+            margin-top: 10px;
+            display: flex;
+            justify-content: center;
+        }
+        svg circle {
+            fill: none;
+            stroke: green;
+            stroke-width: 2;
+            transition: r 0.1s ease;
+        }
+    </style>
+</head>
+<body>
+    <button id="start">🎤 Start STT</button>
+    <button id="stop">🛑 Stop STT</button>
+    <div id="transcript"></div>
+    <div id="status">Status: Idle</div>
+    <div id="volume-indicator">
+        <svg width="100" height="100">
+            <circle cx="50" cy="50" r="10" id="volume-circle" />
+        </svg>
+    </div>
+
+    <script>
+        let audioContext;
+        let analyser;
+        let mediaStream;
+        let socket;
+        let session_id;
+        let isSTTActive = false;
+        const transcriptDiv = document.getElementById('transcript');
+        const statusDiv = document.getElementById('status');
+        const volumeCircle = document.getElementById('volume-circle');
+        const SAMPLE_RATE = 16000;
+        const FRAME_DURATION_MS = 30;
+        const FRAME_SIZE = SAMPLE_RATE * FRAME_DURATION_MS / 1000; // 480 샘플
+
+        function updateStatus(message, className) {
+            statusDiv.textContent = `Status: ${message}`;
+            statusDiv.className = className || '';
+        }
+
+        async function setupAudio() {
+            try {
+                mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                updateStatus('Listening - Waiting for speech...', 'listening');
+                
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+                analyser = audioContext.createAnalyser();
+                analyser.fftSize = 256;
+                const microphone = audioContext.createMediaStreamSource(mediaStream);
+                microphone.connect(analyser);
+
+                const dataArray = new Uint8Array(analyser.frequencyBinCount);
+                function updateVolume() {
+                    analyser.getByteFrequencyData(dataArray);
+                    const volume = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
+                    const radius = 10 + (volume / 255) * 40;
+                    volumeCircle.setAttribute('r', radius);
+                    requestAnimationFrame(updateVolume);
+                }
+                updateVolume();
+
+                return mediaStream;
+            } catch (error) {
+                updateStatus(`Error: Microphone access denied - ${error.message}`, 'error');
+                throw error;
+            }
+        }
+
+        async function startSTT() {
+            if (!mediaStream) {
+                await setupAudio();
+            }
+            updateStatus('Connecting to STT server...', 'listening');
+            try {
+                const response = await fetch('http://localhost:8000/summa-api/v1/sessions/create', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ user_id: 'user1' })
+                });
+                if (!response.ok) throw new Error('Failed to create session');
+                const data = await response.json();
+                session_id = data.session_id;
+
+                socket = new WebSocket(`ws://localhost:8000/summa-api/v1/sessions/${session_id}/ws`);
+                socket.onopen = () => {
+                    updateStatus('Speaking - STT active', 'speaking');
+                    isSTTActive = true;
+                    startRecording(mediaStream);
+                };
+                socket.onmessage = (event) => {
+                    const data = JSON.parse(event.data);
+                    if (data.text) {
+                        updateStatus('Speaking - Speech detected', 'speaking');
+                        transcriptDiv.innerHTML += `<span class="highlight">${data.text}</span> `;
+                        setTimeout(() => {
+                            if (socket.readyState === WebSocket.OPEN && isSTTActive) {
+                                updateStatus('Speaking - STT active', 'speaking');
+                            }
+                        }, 1000);
+                    } else if (data.final_text) {
+                        updateStatus('Stopped', 'stopped');
+                        transcriptDiv.innerHTML = data.final_text.map(t => `${t.timestamp} - ${t.text}`).join('\n');
+                    }
+                };
+                socket.onerror = () => updateStatus('WebSocket error', 'error');
+                socket.onclose = () => {
+                    updateStatus('Stopped', 'stopped');
+                    isSTTActive = false;
+                };
+            } catch (error) {
+                updateStatus(`Error: ${error.message}`, 'error');
+            }
+        }
+
+        function startRecording(stream) {
+            const mediaRecorder = new MediaRecorder(stream, { audioBitsPerSecond: SAMPLE_RATE });
+            let audioBuffer = new Uint8Array(0);
+
+            mediaRecorder.ondataavailable = (event) => {
+                if (socket.readyState === WebSocket.OPEN) {
+                    const chunk = new Uint8Array(event.data);
+                    const newBuffer = new Uint8Array(audioBuffer.length + chunk.length);
+                    newBuffer.set(audioBuffer);
+                    newBuffer.set(chunk, audioBuffer.length);
+                    audioBuffer = newBuffer;
+
+                    // FRAME_SIZE * 2 (960 바이트) 단위로 전송
+                    while (audioBuffer.length >= FRAME_SIZE * 2) {
+                        const sendData = audioBuffer.slice(0, FRAME_SIZE * 2);
+                        socket.send(sendData.buffer);
+                        audioBuffer = audioBuffer.slice(FRAME_SIZE * 2);
+                    }
+                }
+            };
+            mediaRecorder.onstop = () => {
+                if (socket.readyState !== WebSocket.OPEN) {
+                    updateStatus('Stopped', 'stopped');
+                }
+                if (mediaStream) {
+                    mediaStream.getTracks().forEach(track => track.stop());
+                    mediaStream = null;
+                }
+            };
+            mediaRecorder.start(100); // 100ms 간격
+        }
+
+        window.addEventListener('load', async () => {
+            await setupAudio();
+        });
+
+        document.getElementById('start').addEventListener('click', async () => {
+            if (!isSTTActive) {
+                await startSTT();
+            }
+        });
+
+        document.getElementById('stop').addEventListener('click', async () => {
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                try {
+                    await fetch(`http://localhost:8000/summa-api/v1/sessions/${session_id}/finalize`, { method: 'POST' });
+                    socket.close();
+                    isSTTActive = false;
+                } catch (error) {
+                    updateStatus(`Error: ${error.message}`, 'error');
+                }
+            }
+        });
+    </script>
+</body>
+</html>
