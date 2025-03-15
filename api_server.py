@@ -85,8 +85,10 @@ class APIServer:
                         ) as resp:
                             if resp.status == 200:
                                 result = await resp.json()
-                                transcript = result.get("transcript", "")
+                                logger.info(f"[stt_response] information. session_id={session_id}, text={result}")
+                                transcript = result.get("text", "")
                                 await websocket.send_text(json.dumps({"text": transcript}))
+                                logger.info(f"[ws_send] information. session_id={session_id}, text={transcript}")
                             else:
                                 logger.error(f"[STTRequest] error. error_message=STTServerError,session_id={session_id},status_code={resp.status}")
             except WebSocketDisconnect:

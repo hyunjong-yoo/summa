@@ -197,17 +197,29 @@ class STTServer:
             session_id: str
             audio: str  # Hex-encoded bytes
 
-        @self.app.post("/summa-stt/v1/transcripts/real-time", response_model=dict)
-        async def real_time_transcript(request: RealTimeTranscriptRequest):
-            session_id = request.session_id
-            audio_chunk = bytes.fromhex(request.audio)
-            logger.info(f"[RealTimeTranscript] information. session_id={session_id},chunk_size={len(audio_chunk)}")
-            try:
-                self.audio_queue.put((session_id, audio_chunk))
-                return {"session_id": session_id, "transcript": ""}
-            except Exception as e:
-                logger.error(f"[RealTimeTranscript] error. error_message={str(e)},session_id={session_id},chunk_size={len(audio_chunk)}")
-                raise HTTPException(status_code=500, detail=f"Failed to process audio: {str(e)}")
+        @self.app.post("/summa-stt/v1/transcripts/real-time")
+        async def real_time_transcript(data: dict):
+            session_id = data["session_id"]
+            pcm_data = bytes.fromhex(data["audio"])
+            frame_size = 480  # 30ms at 16kHz
+            frames = [pcm_data[i:i + frame_size * 2] for i in range(0, len(pcm_data), frame_size * 2)]
+            
+            with self.lock:
+                if session_id not in self.session_frames:
+                    self.session_frames[session_id] = []
+                for frame in frames:
+                    if len(frame) == frame_size * 2 and self.vad.is_speech(frame, 16000):
+                        self.session_frames[session_id].append(np.frombuffer(frame, dtype=np.int16))
+                
+                if len(self.session_frames[session_id]) >= 10:  # MIN_FRAMES_TO_TRANSCRIBE
+                    audio = np.concatenate(self.session_frames[session_id]).astype(np.float32) / 32768.0
+                    result = self.model.transcribe(audio, language="en")
+                    self.transcript_store[session_id] = result["text"]
+                    self.session_frames[session_id] = []
+                    logger.info(f"[real_time_transcript] information. session_id={session_id}, text={result['text']}")
+                    return result["text"]
+            
+            return self.transcript_store.get(session_id, "")
 
         @self.app.get("/summa-stt/v1/transcripts/{session_id}/full", response_model=dict)
         async def get_full_transcript(session_id: str):
