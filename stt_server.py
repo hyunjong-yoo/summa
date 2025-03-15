@@ -217,7 +217,7 @@ class STTServer:
                     self.transcript_store[session_id] = result["text"]
                     self.session_frames[session_id] = []
                     logger.info(f"[real_time_transcript] information. session_id={session_id}, text={result['text']}")
-                    return result["text"]
+                    return {"text": result}  # JSON 형식으로 반환
             
             return self.transcript_store.get(session_id, "")
 
