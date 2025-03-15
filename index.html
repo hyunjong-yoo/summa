@@ -2,197 +2,161 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>STT WebApp</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Real-Time STT WebApp</title>
     <style>
-        #transcript { 
-            white-space: pre-wrap; 
-            font-family: monospace; 
-            border: 1px solid #ccc; 
-            padding: 10px; 
-            min-height: 100px; 
-        }
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        #transcript { max-height: 300px; overflow-y: auto; border: 1px solid #ccc; padding: 10px; }
+        #status { margin: 10px 0; padding: 5px; }
         .highlight { background-color: yellow; }
-        #status { 
-            margin-top: 10px; 
-            padding: 5px; 
-            border: 1px solid #ccc; 
-            font-weight: bold; 
-        }
-        #status.idle { color: gray; }
-        #status.listening { color: blue; }
-        #status.speaking { color: green; }
-        #status.stopped { color: red; }
-        #status.error { color: red; }
-        #volume-indicator {
-            margin-top: 10px;
-            display: flex;
-            justify-content: center;
-        }
-        svg circle {
-            fill: none;
-            stroke: green;
-            stroke-width: 2;
-            transition: r 0.1s ease;
-        }
+        canvas { display: block; margin: 10px 0; }
     </style>
 </head>
 <body>
-    <button id="start">🎤 Start STT</button>
-    <button id="stop">🛑 Stop STT</button>
+    <button id="startBtn">🎤 Start</button>
+    <button id="stopBtn" disabled>🛑 Stop</button>
+    <div id="status">Idle</div>
+    <canvas id="visualizer" width="100" height="100"></canvas>
     <div id="transcript"></div>
-    <div id="status">Status: Idle</div>
-    <div id="volume-indicator">
-        <svg width="100" height="100">
-            <circle cx="50" cy="50" r="10" id="volume-circle" />
-        </svg>
-    </div>
 
     <script>
-        let audioContext;
-        let analyser;
-        let mediaStream;
-        let socket;
-        let session_id;
-        let isSTTActive = false;
-        const transcriptDiv = document.getElementById('transcript');
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
         const statusDiv = document.getElementById('status');
-        const volumeCircle = document.getElementById('volume-circle');
-        const SAMPLE_RATE = 16000;
-        const FRAME_DURATION_MS = 30;
-        const FRAME_SIZE = SAMPLE_RATE * FRAME_DURATION_MS / 1000; // 480 샘플
+        const transcriptDiv = document.getElementById('transcript');
+        const canvas = document.getElementById('visualizer');
+        const ctx = canvas.getContext('2d');
 
-        function updateStatus(message, className) {
-            statusDiv.textContent = `Status: ${message}`;
-            statusDiv.className = className || '';
-        }
+        let audioContext, processor, stream, socket, analyser, sessionId;
 
-        async function setupAudio() {
-            try {
-                mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                updateStatus('Listening - Waiting for speech...', 'listening');
-                
-                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
-                analyser = audioContext.createAnalyser();
-                analyser.fftSize = 256;
-                const microphone = audioContext.createMediaStreamSource(mediaStream);
-                microphone.connect(analyser);
+        // 오디오 초기화 및 Web Audio API 설정
+        async function initAudio() {
+            stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            audioContext = new AudioContext({ sampleRate: 16000 });
+            const source = audioContext.createMediaStreamSource(stream);
+            processor = audioContext.createScriptProcessor(2048, 1, 1);
+            analyser = audioContext.createAnalyser(); // 내장 VAD용 분석기
+            analyser.fftSize = 2048;
+            source.connect(analyser);
+            analyser.connect(processor);
+            processor.connect(audioContext.destination);
 
-                const dataArray = new Uint8Array(analyser.frequencyBinCount);
-                function updateVolume() {
-                    analyser.getByteFrequencyData(dataArray);
-                    const volume = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
-                    const radius = 10 + (volume / 255) * 40;
-                    volumeCircle.setAttribute('r', radius);
-                    requestAnimationFrame(updateVolume);
+            processor.onaudioprocess = (event) => {
+                const pcmData = event.inputBuffer.getChannelData(0);
+                const int16Data = new Int16Array(pcmData.length);
+                for (let i = 0; i < pcmData.length; i++) {
+                    int16Data[i] = Math.max(-32768, Math.min(32767, pcmData[i] * 32768));
                 }
-                updateVolume();
 
-                return mediaStream;
-            } catch (error) {
-                updateStatus(`Error: Microphone access denied - ${error.message}`, 'error');
-                throw error;
-            }
+                // Web Audio API 내장 VAD: 볼륨 기반 음성 감지
+                const buffer = new Float32Array(analyser.frequencyBinCount);
+                analyser.getFloatFrequencyData(buffer);
+                const volume = Math.max(...pcmData.map(Math.abs));
+                const isSpeech = volume > 0.01; // 임계값 0.01로 음성 감지 (조정 가능)
+
+                if (isSpeech) {
+                    statusDiv.textContent = "Speaking - Speech detected";
+                    statusDiv.style.color = "green";
+                    if (socket && socket.readyState === WebSocket.OPEN) {
+                        socket.send(int16Data.buffer); // 음성 감지 시 데이터 전송
+                    }
+                } else {
+                    statusDiv.textContent = "Listening - Waiting for speech...";
+                    statusDiv.style.color = "blue";
+                }
+                visualizeVolume(pcmData); // 실시간 볼륨 시각화
+            };
         }
 
-        async function startSTT() {
-            if (!mediaStream) {
-                await setupAudio();
-            }
-            updateStatus('Connecting to STT server...', 'listening');
+        // Canvas로 음성 볼륨 시각화
+        function visualizeVolume(data) {
+            const volume = Math.max(...data.map(Math.abs));
+            const radius = 10 + volume * 40; // 최소 10px, 최대 50px
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.beginPath();
+            ctx.arc(50, 50, radius, 0, 2 * Math.PI);
+            ctx.fillStyle = "blue";
+            ctx.fill();
+        }
+
+        // 세션 생성 및 STT 시작
+        startBtn.onclick = async () => {
             try {
-                const response = await fetch('http://localhost:8000/summa-api/v1/sessions/create', {
+                // 서버에서 세션 ID 요청
+                const sessionResponse = await fetch('http://localhost:8000/summa-api/v1/sessions/create', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ user_id: 'user1' })
+                    body: JSON.stringify({ user_id: 'user123' }) // 임의 사용자 ID
                 });
-                if (!response.ok) throw new Error('Failed to create session');
-                const data = await response.json();
-                session_id = data.session_id;
+                const sessionData = await sessionResponse.json();
+                sessionId = sessionData.session_id;
 
-                socket = new WebSocket(`ws://localhost:8000/summa-api/v1/sessions/${session_id}/ws`);
+                await initAudio(); // 오디오 초기화
+                statusDiv.textContent = "Connecting to WebSocket...";
+                statusDiv.style.color = "gray";
+
+                // WebSocket 연결
+                socket = new WebSocket(`ws://localhost:8000/summa-api/v1/sessions/${sessionId}/ws`);
                 socket.onopen = () => {
-                    updateStatus('Speaking - STT active', 'speaking');
-                    isSTTActive = true;
-                    startRecording(mediaStream);
+                    startBtn.disabled = true;
+                    stopBtn.disabled = false;
+                    statusDiv.textContent = "Listening - Waiting for speech...";
+                    statusDiv.style.color = "blue";
+                    console.log(`WebSocket connected for session: ${sessionId}`);
                 };
                 socket.onmessage = (event) => {
-                    const data = JSON.parse(event.data);
-                    if (data.text) {
-                        updateStatus('Speaking - Speech detected', 'speaking');
-                        transcriptDiv.innerHTML += `<span class="highlight">${data.text}</span> `;
-                        setTimeout(() => {
-                            if (socket.readyState === WebSocket.OPEN && isSTTActive) {
-                                updateStatus('Speaking - STT active', 'speaking');
-                            }
-                        }, 1000);
-                    } else if (data.final_text) {
-                        updateStatus('Stopped', 'stopped');
-                        transcriptDiv.innerHTML = data.final_text.map(t => `${t.timestamp} - ${t.text}`).join('\n');
-                    }
+                    const text = event.data;
+                    const p = document.createElement('p');
+                    p.textContent = text;
+                    p.classList.add('highlight');
+                    transcriptDiv.appendChild(p);
+                    transcriptDiv.scrollTop = transcriptDiv.scrollHeight;
                 };
-                socket.onerror = () => updateStatus('WebSocket error', 'error');
+                socket.onerror = (error) => {
+                    statusDiv.textContent = `Error: WebSocket connection failed`;
+                    statusDiv.style.color = "red";
+                    console.error("WebSocket error:", error);
+                };
                 socket.onclose = () => {
-                    updateStatus('Stopped', 'stopped');
-                    isSTTActive = false;
+                    console.log("WebSocket closed");
                 };
             } catch (error) {
-                updateStatus(`Error: ${error.message}`, 'error');
+                statusDiv.textContent = `Error: ${error.message}`;
+                statusDiv.style.color = "red";
+                console.error("Start error:", error);
             }
-        }
+        };
 
-        function startRecording(stream) {
-            const mediaRecorder = new MediaRecorder(stream, { audioBitsPerSecond: SAMPLE_RATE });
-            let audioBuffer = new Uint8Array(0);
-
-            mediaRecorder.ondataavailable = (event) => {
-                if (socket.readyState === WebSocket.OPEN) {
-                    const chunk = new Uint8Array(event.data);
-                    const newBuffer = new Uint8Array(audioBuffer.length + chunk.length);
-                    newBuffer.set(audioBuffer);
-                    newBuffer.set(chunk, audioBuffer.length);
-                    audioBuffer = newBuffer;
-
-                    // FRAME_SIZE * 2 (960 바이트) 단위로 전송
-                    while (audioBuffer.length >= FRAME_SIZE * 2) {
-                        const sendData = audioBuffer.slice(0, FRAME_SIZE * 2);
-                        socket.send(sendData.buffer);
-                        audioBuffer = audioBuffer.slice(FRAME_SIZE * 2);
-                    }
-                }
-            };
-            mediaRecorder.onstop = () => {
-                if (socket.readyState !== WebSocket.OPEN) {
-                    updateStatus('Stopped', 'stopped');
-                }
-                if (mediaStream) {
-                    mediaStream.getTracks().forEach(track => track.stop());
-                    mediaStream = null;
-                }
-            };
-            mediaRecorder.start(100); // 100ms 간격
-        }
-
-        window.addEventListener('load', async () => {
-            await setupAudio();
-        });
-
-        document.getElementById('start').addEventListener('click', async () => {
-            if (!isSTTActive) {
-                await startSTT();
-            }
-        });
-
-        document.getElementById('stop').addEventListener('click', async () => {
-            if (socket && socket.readyState === WebSocket.OPEN) {
-                try {
-                    await fetch(`http://localhost:8000/summa-api/v1/sessions/${session_id}/finalize`, { method: 'POST' });
+        // STT 중지
+        stopBtn.onclick = async () => {
+            try {
+                stream.getTracks().forEach(track => track.stop());
+                processor.disconnect();
+                analyser.disconnect();
+                audioContext.close();
+                if (socket && socket.readyState === WebSocket.OPEN) {
                     socket.close();
-                    isSTTActive = false;
-                } catch (error) {
-                    updateStatus(`Error: ${error.message}`, 'error');
                 }
+
+                // 최종 텍스트 요청
+                const response = await fetch(`http://localhost:8000/summa-api/v1/sessions/${sessionId}/finalize`, {
+                    method: 'POST'
+                });
+                const finalText = await response.json();
+                const p = document.createElement('p');
+                p.textContent = `${finalText.timestamp}: ${finalText.text}`;
+                transcriptDiv.appendChild(p);
+
+                startBtn.disabled = false;
+                stopBtn.disabled = true;
+                statusDiv.textContent = "Stopped";
+                statusDiv.style.color = "red";
+            } catch (error) {
+                statusDiv.textContent = `Error: ${error.message}`;
+                statusDiv.style.color = "red";
+                console.error("Stop error:", error);
             }
-        });
+        };
     </script>
 </body>
 </html>
