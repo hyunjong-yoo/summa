@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import redis.asyncio as redis
 from aiohttp import ClientSession
+import traceback
 
 # 로깅 설정
 logging.basicConfig(
@@ -86,7 +87,8 @@ class APIServer:
                             if resp.status == 200:
                                 response = await resp.json()
                                 logger.info(f"[stt_response] information. session_id={session_id}, response={response}")
-                                text = response.get("text", "")
+                                logger.info(f"[response] information. session_id={session_id}, text={response}")
+                                text = response.get("text", "not exists")
                                 #await websocket.send_text(json.dumps({"text": text}))
                                 await websocket.send_text(text)
                                 logger.info(f"[ws_send] information. session_id={session_id}, text={text}")
@@ -96,7 +98,7 @@ class APIServer:
                 logger.info(f"[WebSocketEndpoint] information. session_id={session_id},status=disconnected")
                 del self.websocket_connections[session_id]
             except Exception as e:
-                logger.error(f"[WebSocketEndpoint] error. error_message={str(e)},session_id={session_id}")
+                logger.error(f"[WebSocketEndpoint] error. error_message={str(e)},session_id={session_id},response={response}", traceback.format_exc())
                 del self.websocket_connections[session_id]
 
         class SessionCreateRequest(BaseModel):

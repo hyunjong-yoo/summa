@@ -152,7 +152,9 @@ class STTServer:
                 return
             silence_count = 0
             for frame in frames[-SILENCE_THRESHOLD:]:
-                if not self.vad.is_speech(frame, SAMPLE_RATE):
+                is_speech = self.vad.is_speech(frame, SAMPLE_RATE)
+                logger.info(f"[vad_check] information. session_id={session_id}, is_speech={is_speech}")
+                if not is_speech:
                     silence_count += 1
 
             if silence_count >= SILENCE_THRESHOLD and len(frames) >= MIN_FRAMES_TO_TRANSCRIBE:
@@ -208,12 +210,13 @@ class STTServer:
                 if session_id not in self.session_frames:
                     self.session_frames[session_id] = []
                 for frame in frames:
-                    if len(frame) == frame_size * 2 and self.vad.is_speech(frame, 16000):
+                    is_speech = self.vad.is_speech(frame, SAMPLE_RATE)
+                    if len(frame) == frame_size * 2 and is_speech:
                         self.session_frames[session_id].append(np.frombuffer(frame, dtype=np.int16))
                 
                 if len(self.session_frames[session_id]) >= 10:  # MIN_FRAMES_TO_TRANSCRIBE
                     audio = np.concatenate(self.session_frames[session_id]).astype(np.float32) / 32768.0
-                    result = self.model.transcribe(audio, language="en")
+                    result = self.model.transcribe(audio, language="ko")
                     self.transcript_store[session_id] = result["text"]
                     self.session_frames[session_id] = []
                     logger.info(f"[real_time_transcript] information. session_id={session_id}, text={result['text']}")
