@@ -12,6 +12,7 @@ import whisper
 import torch
 import os
 from pathlib import Path
+import aiohttp
 
 # 로깅 설정
 logging.basicConfig(
@@ -190,10 +191,24 @@ class STTServer:
                 if session_id not in self.transcript_store:
                     self.transcript_store[session_id] = []
                 self.transcript_store[session_id].append({"text": text, "timestamp": "2025-03-14T00:00:00Z"})
+                # API 서버로 결과 전달
+                #await self.send_to_api_server(session_id, text)
+                
             logger.info(f"[ProcessTranscribe] information. session_id={session_id},text_length={len(text)}")
         except Exception as e:
             logger.error(f"[ProcessTranscribe] error. error_message={str(e)},session_id={session_id},frame_count={len(frames)}")
-
+	
+    async def send_to_api_server(self, session_id: str, text: str):
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f'http://localhost:8000/summa-api/v1/sessions/{session_id}/transcribe-result',
+                json={"text": text}
+            ) as resp:
+                if resp.status == 200:
+                    logger.info(f"[send_to_api] information. session_id={session_id}, status={resp.status}")
+                else:
+                    logger.error(f"[send_to_api] error. session_id={session_id}, status={resp.status}")
+                    
     def register_endpoints(self):
         class RealTimeTranscriptRequest(BaseModel):
             session_id: str
